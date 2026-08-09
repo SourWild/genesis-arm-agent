@@ -26,6 +26,14 @@ COLORS: dict[str, tuple[float, float, float, float]] = {
     "blue": (0.15, 0.35, 0.9, 1.0),
 }
 
+FRANKA_XML = "xml/franka_emika_panda/panda.xml"
+# Franka MJCF actuators aren't PD-reducible by default; explicit gains are
+# required for control_dofs_position to converge (see Genesis quickstart).
+ARM_KP = [4500, 4500, 3500, 3500, 2000, 2000, 2000]
+ARM_KV = [450, 450, 350, 350, 200, 200, 200]
+FINGER_KP = [100, 100]
+FINGER_KV = [10, 10]
+
 
 def _sample_non_overlapping(
     existing: list[tuple[float, float, float]],
@@ -75,6 +83,8 @@ def build_scene(show_viewer: bool = False, seed: Optional[int] = None) -> gs.Sce
     The returned Scene has extra attributes attached for later phases to use:
     - `blocks` / `targets`: dict of color name -> RigidEntity
     - `cam_top` / `cam_side`: Camera handles
+    - `franka` / `hand`: RigidEntity and end-effector link
+    - `arm_dofs` / `finger_dofs`: dof index lists for arm and gripper control
     """
     gs.init(backend=gs.metal, precision="32")
 
@@ -116,12 +126,26 @@ def build_scene(show_viewer: bool = False, seed: Optional[int] = None) -> gs.Sce
         res=(480, 480), pos=(1.3, -0.9, 0.6), lookat=(0.5, 0.0, 0.1), fov=45, GUI=False
     )
 
+    franka = scene.add_entity(gs.morphs.MJCF(file=FRANKA_XML))
+
     scene.build()
+
+    arm_dofs = [franka.get_joint(f"joint{i}").dof_idx_local for i in range(1, 8)]
+    finger_dofs = [
+        franka.get_joint("finger_joint1").dof_idx_local,
+        franka.get_joint("finger_joint2").dof_idx_local,
+    ]
+    franka.set_dofs_kp(ARM_KP + FINGER_KP, dofs_idx_local=arm_dofs + finger_dofs)
+    franka.set_dofs_kv(ARM_KV + FINGER_KV, dofs_idx_local=arm_dofs + finger_dofs)
 
     scene.blocks = blocks
     scene.targets = targets
     scene.cam_top = cam_top
     scene.cam_side = cam_side
+    scene.franka = franka
+    scene.hand = franka.get_link("hand")
+    scene.arm_dofs = arm_dofs
+    scene.finger_dofs = finger_dofs
     scene._layout_rng = rng
 
     return scene
