@@ -1,0 +1,10 @@
+[project]
+name = "genesis-arm-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "genesis-world>=1.3.2",
+    "torch>=2.13.0",
+]
