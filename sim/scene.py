@@ -147,6 +147,24 @@ def build_scene(show_viewer: bool = False, seed: Optional[int] = None) -> gs.Sce
     scene.arm_dofs = arm_dofs
     scene.finger_dofs = finger_dofs
     scene._layout_rng = rng
+    # Home pose already has the hand's local Z axis pointing along world -Z (gripper
+    # straight down) — hold this orientation for all moves so IK doesn't leave rotation
+    # unconstrained, which let the gripper approach objects at arbitrary angles and knock
+    # them around instead of grasping them.
+    scene.grasp_quat = scene.hand.get_quat().tolist()
+    # The "hand" link is the wrist flange, not the grasp point: the finger PADS extend
+    # ~11cm below it (not just ~6cm to the finger link origin — the link origin is a
+    # pivot point well above the pad tip). Targeting the hand link directly at block
+    # height rams the fingertips into the table before the wrist gets anywhere close.
+    # Measure the true offset from actual collision geometry (AABB), not link origins,
+    # so controller.py can target the real grasp point (fingertip level) instead.
+    finger_tip_z = min(
+        geom.get_AABB()[0, 2].item()
+        for link_name in ("left_finger", "right_finger")
+        for geom in franka.get_link(link_name).geoms
+    )
+    hand_z = scene.hand.get_pos()[2]
+    scene.grasp_point_offset = float(hand_z - finger_tip_z)
 
     return scene
 
