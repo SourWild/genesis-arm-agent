@@ -85,7 +85,12 @@ def build_scene(show_viewer: bool = False, seed: Optional[int] = None) -> gs.Sce
     - `cam_top` / `cam_side`: Camera handles
     - `franka` / `hand`: RigidEntity and end-effector link
     - `arm_dofs` / `finger_dofs`: dof index lists for arm and gripper control
+
+    Genesis only allows one `gs.init()` per process, so calling this a second time (e.g.
+    evaluate.py running several episodes in one run) destroys the previous simulation first.
     """
+    if gs._initialized:
+        gs.destroy()
     gs.init(backend=gs.metal, precision="32")
 
     scene = gs.Scene(show_viewer=show_viewer)

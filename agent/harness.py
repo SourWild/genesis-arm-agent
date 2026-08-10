@@ -27,7 +27,7 @@ LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 
 
 class ToolExecutor:
-    """Binds a built scene to the 4 tools so the LLM only ever sees TOOLS_SCHEMA's declared args."""
+    """Binds a built scene to the 5 tools so the LLM only ever sees TOOLS_SCHEMA's declared args."""
 
     def __init__(self, scene: Any) -> None:
         self.scene = scene
@@ -49,6 +49,9 @@ class ToolExecutor:
 
     def control_gripper(self, action: str) -> dict[str, Any]:
         return tools.control_gripper(self.scene, action)
+
+    def check_task_success(self, block_color: str, target_color: str) -> dict[str, Any]:
+        return tools.check_task_success(self.scene, block_color, target_color)
 
 
 class TraceWriter:
@@ -91,10 +94,15 @@ def run_episode(
     max_steps: int = MAX_STEPS,
     seed: Optional[int] = None,
     show_viewer: bool = False,
+    block_color: Optional[str] = None,
+    target_color: Optional[str] = None,
 ) -> dict[str, Any]:
     """Run one instruction through the LLM tool-calling loop against a fresh scene.
 
     Returns {"success": bool, "message": str, "steps_used": int, "trace_path": str}.
+    `success` is the LLM's own self-report (it decided it was done). If `block_color` and
+    `target_color` are given, an objective `ground_truth` dict (from tools.check_task_success)
+    is also included — evaluate.py uses this instead of trusting the LLM's self-report.
     """
     if not MOONSHOT_API_KEY:
         raise RuntimeError("MOONSHOT_API_KEY 未设置，请在 .env 里配置")
@@ -115,6 +123,14 @@ def run_episode(
 
     malformed_retries = 0
     result = {"success": False, "message": "未完成：达到最大步数限制", "steps_used": max_steps}
+
+    def finalize(result: dict[str, Any]) -> dict[str, Any]:
+        if block_color is not None and target_color is not None:
+            verdict = tools.check_task_success(scene, block_color, target_color)
+            result["ground_truth"] = verdict["data"]
+        result["trace_path"] = str(trace_path)
+        trace.write({"type": "episode_end", **result})
+        return result
 
     try:
         for step in range(1, max_steps + 1):
@@ -162,10 +178,8 @@ def run_episode(
                             "success": False,
                             "message": f"tool 调用格式连续错误超过 {MAX_MALFORMED_TOOL_CALL_RETRIES} 次，终止",
                             "steps_used": step,
-                            "trace_path": str(trace_path),
                         }
-                        trace.write({"type": "episode_end", **result})
-                        return result
+                        return finalize(result)
                 else:
                     trace.write({"type": "tool_call", "step": step, "name": name, "args": args})
                     tool_result = executor.dispatch(name, args)
@@ -181,8 +195,6 @@ def run_episode(
         else:
             trace.write({"type": "timeout", "max_steps": max_steps})
 
-        result["trace_path"] = str(trace_path)
-        trace.write({"type": "episode_end", **result})
-        return result
+        return finalize(result)
     finally:
         trace.close()

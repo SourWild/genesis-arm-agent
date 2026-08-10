@@ -1,4 +1,4 @@
-"""The 4 pick-place tools exposed to the LLM planner, plus their function-calling schema.
+"""The 5 pick-place tools exposed to the LLM planner, plus their function-calling schema.
 
 Every tool takes the built `scene` (see sim.scene.build_scene) as its first argument and
 returns the project-wide unified format: {"success": bool, "message": str, "data": dict | None}.
@@ -14,6 +14,11 @@ import numpy as np
 
 import genesis as gs
 from sim import controller
+from sim.scene import TARGET_RADIUS
+
+# "宽松成功判定": a block counts as placed once its center is within the target zone's
+# radius, ignoring height — matches Phase 5's spec (< 4cm, which happens to equal TARGET_RADIUS).
+SUCCESS_XY_THRESHOLD = TARGET_RADIUS
 
 
 def _ok(message: str, data: Optional[dict] = None) -> dict[str, Any]:
@@ -62,12 +67,20 @@ def get_camera_image(scene: gs.Scene, view: str) -> dict[str, Any]:
 
 
 def move_ee(scene: gs.Scene, x: float, y: float, z: float, gripper_state: str) -> dict[str, Any]:
-    """Tool 3: smoothly move the end-effector to (x, y, z) while driving the gripper."""
+    """Tool 3: smoothly move the end-effector to (x, y, z) while driving the gripper.
+
+    success=False (with the reached position still reported in data) in two distinct cases:
+    - IK 不可达: the target pose itself has no solution under the fixed downward grasp
+      orientation — usually outside the reachable workspace.
+    - 位置偏差过大: IK found a solution but the arm didn't get there physically (e.g.
+      blocked by a collision with the table or another block).
+    """
     try:
         if gripper_state not in ("open", "close"):
             return _err(f"gripper_state 必须是 'open' 或 'close'，收到: {gripper_state!r}")
         target = (x, y, z)
-        reached = controller.move_ee_smooth(scene, target, gripper_state=gripper_state)
+        result = controller.move_ee_smooth(scene, target, gripper_state=gripper_state)
+        reached = result["reached_pos"]
         error_xyz = [reached[i] - target[i] for i in range(3)]
         error_norm = float(np.linalg.norm(error_xyz))
         data = {
@@ -76,14 +89,38 @@ def move_ee(scene: gs.Scene, x: float, y: float, z: float, gripper_state: str) -
             "error_xyz": error_xyz,
             "error_norm_m": error_norm,
             "gripper_state": controller.get_gripper_state(scene),
+            "ik_reachable": result["ik_reachable"],
         }
+        if not result["ik_reachable"]:
+            return {
+                "success": False,
+                "message": (
+                    f"移动失败：目标位置 IK 不可达（残差 {result['ik_error_m'] * 1000:.1f}mm），"
+                    "可能超出机械臂工作范围，建议换一个更靠近工作区中心的坐标重试"
+                ),
+                "data": data,
+            }
+        if error_norm > controller.MOVE_ERROR_WARN_M:
+            return {
+                "success": False,
+                "message": (
+                    f"移动完成但位置偏差过大（{error_norm * 1000:.1f}mm，超过 "
+                    f"{controller.MOVE_ERROR_WARN_M * 1000:.0f}mm 容差），可能被方块或桌面卡住，"
+                    "建议 get_scene_state 确认实际位置后重试"
+                ),
+                "data": data,
+            }
         return _ok(f"移动完成，末端误差 {error_norm * 1000:.1f}mm", data)
     except Exception as e:
         return _err(f"move_ee 失败: {e}")
 
 
 def control_gripper(scene: gs.Scene, action: str) -> dict[str, Any]:
-    """Tool 4: open or close the gripper without moving the end-effector."""
+    """Tool 4: open or close the gripper without moving the end-effector.
+
+    success=False when closing lands almost fully shut (< 1cm between fingers) — that
+    usually means the gripper closed on empty air instead of a block (抓空).
+    """
     try:
         if action not in ("open", "close"):
             return _err(f"action 必须是 'open' 或 'close'，收到: {action!r}")
@@ -93,9 +130,51 @@ def control_gripper(scene: gs.Scene, action: str) -> dict[str, Any]:
             "finger_positions": finger_positions,
             "gripper_state": controller.get_gripper_state(scene),
         }
+        if action == "close" and (sum(finger_positions) / 2) < controller.EMPTY_GRASP_THRESHOLD:
+            data["possible_empty_grasp"] = True
+            return {
+                "success": False,
+                "message": (
+                    f"gripper 已闭合但指间距几乎为 0（{sum(finger_positions) / 2 * 1000:.1f}mm），"
+                    "大概率没有夹到方块（抓空），建议重新 get_scene_state 确认方块位置后重试抓取"
+                ),
+                "data": data,
+            }
         return _ok(f"gripper {action} 完成", data)
     except Exception as e:
         return _err(f"control_gripper 失败: {e}")
+
+
+def check_task_success(scene: gs.Scene, block_color: str, target_color: str) -> dict[str, Any]:
+    """Tool 5: objectively check whether block_color's block is within the success threshold
+    of target_color's target zone (xy distance < 4cm, height ignored — "宽松成功判定").
+
+    Use this instead of eyeballing get_scene_state coordinates before declaring a task done.
+    """
+    try:
+        if block_color not in scene.blocks:
+            return _err(f"未知方块颜色: {block_color!r}，可选: {list(scene.blocks)}")
+        if target_color not in scene.targets:
+            return _err(f"未知目标区域颜色: {target_color!r}，可选: {list(scene.targets)}")
+        block_xy = np.array(scene.blocks[block_color].get_pos().tolist()[:2])
+        target_xy = np.array(scene.targets[target_color].get_pos().tolist()[:2])
+        distance = float(np.linalg.norm(block_xy - target_xy))
+        task_success = distance < SUCCESS_XY_THRESHOLD
+        data = {
+            "block_color": block_color,
+            "target_color": target_color,
+            "xy_distance_m": distance,
+            "threshold_m": SUCCESS_XY_THRESHOLD,
+            "task_success": task_success,
+        }
+        verdict = "达标" if task_success else "未达标"
+        msg = (
+            f"{block_color}方块距{target_color}目标区域中心 {distance * 1000:.1f}mm，"
+            f"{verdict}（阈值 {SUCCESS_XY_THRESHOLD * 1000:.0f}mm）"
+        )
+        return _ok(msg, data)
+    except Exception as e:
+        return _err(f"check_task_success 失败: {e}")
 
 
 # OpenAI-compatible function-calling schema (Kimi K2 uses the same format).
@@ -169,6 +248,32 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                     }
                 },
                 "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_task_success",
+            "description": (
+                "客观检查某个方块是否已经放进某个目标区域：判据是方块中心与目标区域中心的水平(xy)"
+                "距离小于 4cm（忽略高度）。完成放置动作后，用这个工具确认，而不是自己心算坐标距离。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "block_color": {
+                        "type": "string",
+                        "enum": ["red", "green", "blue"],
+                        "description": "要检查的方块颜色",
+                    },
+                    "target_color": {
+                        "type": "string",
+                        "enum": ["red", "green", "blue"],
+                        "description": "要检查的目标区域颜色",
+                    },
+                },
+                "required": ["block_color", "target_color"],
             },
         },
     },
