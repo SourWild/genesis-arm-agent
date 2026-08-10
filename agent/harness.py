@@ -7,12 +7,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 from dotenv import load_dotenv
 from openai import APIError, OpenAI
 
 from agent import tools
 from agent.prompts import SYSTEM_PROMPT
+from sim import controller as sim_controller
 from sim.scene import build_scene
+from utils.voice import speak
 
 load_dotenv()
 
@@ -24,6 +27,24 @@ MAX_STEPS = 20
 MAX_API_RETRIES = 3
 MAX_MALFORMED_TOOL_CALL_RETRIES = 3
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
+
+COLOR_ZH = {"red": "红", "green": "绿", "blue": "蓝"}
+# How close the EE needs to be (xy, meters) to a block/target to credit a grasp/placement
+# to it, when announcing which one just happened.
+GRASP_ANNOUNCE_RADIUS_M = 0.05
+PLACE_ANNOUNCE_RADIUS_M = 0.08
+VOICE_FAILURE_MSG_MAX_CHARS = 40
+
+
+def _nearest_color(entities: dict[str, Any], ee_xy: list[float]) -> tuple[Optional[str], float]:
+    """Nearest entity (by xy distance) among a {color: RigidEntity} dict, e.g. scene.blocks."""
+    best_color, best_dist = None, float("inf")
+    for color, entity in entities.items():
+        xy = entity.get_pos().tolist()[:2]
+        dist = float(np.linalg.norm(np.array(xy) - np.array(ee_xy)))
+        if dist < best_dist:
+            best_color, best_dist = color, dist
+    return best_color, best_dist
 
 
 class ToolExecutor:
@@ -115,6 +136,7 @@ def run_episode(
     trace_path = LOGS_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
     trace = TraceWriter(trace_path)
     trace.write({"type": "episode_start", "instruction": instruction, "model": MOONSHOT_MODEL})
+    speak("收到指令，开始执行")
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -122,6 +144,7 @@ def run_episode(
     ]
 
     malformed_retries = 0
+    holding_block: Optional[str] = None  # color of the block currently believed to be grasped
     result = {"success": False, "message": "未完成：达到最大步数限制", "steps_used": max_steps}
 
     def finalize(result: dict[str, Any]) -> dict[str, Any]:
@@ -130,6 +153,10 @@ def run_episode(
             result["ground_truth"] = verdict["data"]
         result["trace_path"] = str(trace_path)
         trace.write({"type": "episode_end", **result})
+        if result["success"]:
+            speak("任务完成")
+        else:
+            speak(f"任务失败，原因：{result['message'][:VOICE_FAILURE_MSG_MAX_CHARS]}")
         return result
 
     try:
@@ -184,6 +211,19 @@ def run_episode(
                     trace.write({"type": "tool_call", "step": step, "name": name, "args": args})
                     tool_result = executor.dispatch(name, args)
                     trace.write({"type": "tool_result", "step": step, "name": name, "result": tool_result})
+
+                    if name == "control_gripper" and tool_result["success"]:
+                        ee_xy = sim_controller.get_ee_pos(scene)[:2]
+                        if args.get("action") == "close":
+                            color, dist = _nearest_color(scene.blocks, ee_xy)
+                            if color is not None and dist < GRASP_ANNOUNCE_RADIUS_M:
+                                holding_block = color
+                                speak(f"已抓取{COLOR_ZH[color]}方块")
+                        elif args.get("action") == "open" and holding_block is not None:
+                            color, dist = _nearest_color(scene.targets, ee_xy)
+                            if color is not None and dist < PLACE_ANNOUNCE_RADIUS_M:
+                                speak(f"已放置到{COLOR_ZH[color]}区域")
+                            holding_block = None
 
                 messages.append(
                     {
